@@ -39,6 +39,13 @@ function parseFilter(input: Record<string, unknown>): DateFilter | undefined {
   return f;
 }
 
+function parsePositiveInteger(value: unknown, max?: number): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const intValue = Math.floor(value);
+  if (intValue < 1) return undefined;
+  return max ? Math.min(intValue, max) : intValue;
+}
+
 function textResult(data: unknown): vscode.LanguageModelToolResult {
   return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(data, null, 2))]);
 }
@@ -154,16 +161,16 @@ const TOOL_DEFS: ToolDef[] = [
       type: 'object',
       properties: {
         sessionId: { type: 'string', description: 'Get detail for a specific session by ID' },
-        page: { type: 'number', description: 'Page number (1-based) for paginated session list' },
-        pageSize: { type: 'number', description: 'Number of sessions per page (max 50)' },
+        page: { type: 'integer', minimum: 1, description: 'Page number (1-based) for paginated session list' },
+        pageSize: { type: 'integer', minimum: 1, maximum: 50, description: 'Number of sessions per page (max 50)' },
         search: { type: 'string', description: 'Search term to filter sessions by workspace name or message content' },
         ...FILTER_SCHEMA,
       },
     },
     invoke: (a, input) => textResult(formatSessions(a, {
       sessionId: input.sessionId as string | undefined,
-      page: input.page as number | undefined,
-      pageSize: input.pageSize as number | undefined,
+      page: parsePositiveInteger(input.page),
+      pageSize: parsePositiveInteger(input.pageSize, 50),
       search: input.search as string | undefined,
     }, parseFilter(input))),
     prepareMessage: 'Loading sessions…',

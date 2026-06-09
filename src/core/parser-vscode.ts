@@ -8,7 +8,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Session, SessionRequest, ToolConfirmation } from './types';
-import { createRequest, createSession, detectDevcontainerFromRequests, extractSkillNameFromPath, ParseContext, prefetchCache } from './parser-shared';
+import { createRequest, createSession, detectDevcontainerFromRequests, extractSkillNameFromPath, ParseContext, prefetchCache, stripSingleSession } from './parser-shared';
 import { debugCore, warnCore } from './log';
 import { canonicalizeReasoningEffort, extractReasoningEffortFromModelId } from './helpers';
 import { parseCLIEventsFile } from './parser-vscode-cli';
@@ -230,6 +230,14 @@ function initializeWorkspaceEntry(
 }
 
 
+/**
+ * Strip heavy text from sessions appended at or after `startIdx`. Used to free per-workspace
+ * full text immediately after each workspace is parsed, capping the cold-parse heap peak (#106).
+ */
+function stripSessionsFrom(sessions: Session[], startIdx: number): void {
+  for (let i = startIdx; i < sessions.length; i++) stripSingleSession(sessions[i]);
+}
+
 export function processWorkspaceEntry(
   logsDir: string,
   wsId: string,
@@ -237,6 +245,7 @@ export function processWorkspaceEntry(
   ctx: ParseContext,
 ): string {
   const { workspaces, sessions, editLocIndex, sessionSourceIndex } = ctx;
+  const startIdx = sessions.length;
   const { entryPath, wsName, isCLI, customInstructionsBytes } = initializeWorkspaceEntry(logsDir, wsId, harness, workspaces);
 
   if (isCLI) {
@@ -252,6 +261,7 @@ export function processWorkspaceEntry(
         harness,
       });
     }
+    stripSessionsFrom(sessions, startIdx);
     return wsName;
   }
 
@@ -288,6 +298,9 @@ export function processWorkspaceEntry(
     parseEditStateFile(stateFile, editLocIndex);
   }
 
+  // Strip the heavy text from sessions added by this workspace immediately, so full-text
+  // does not accumulate across every workspace during a cold parse (issue #106).
+  stripSessionsFrom(sessions, startIdx);
   return wsName;
 }
 
@@ -299,6 +312,7 @@ export async function processWorkspaceEntryAsync(
   onProgress?: (progress: WorkspaceParseProgress) => void,
 ): Promise<string> {
   const { workspaces, sessions, editLocIndex, sessionSourceIndex } = ctx;
+  const startIdx = sessions.length;
   const { entryPath, wsName, isCLI, customInstructionsBytes } = initializeWorkspaceEntry(logsDir, wsId, harness, workspaces);
 
   if (isCLI) {
@@ -314,6 +328,7 @@ export async function processWorkspaceEntryAsync(
         harness,
       });
     }
+    stripSessionsFrom(sessions, startIdx);
     return wsName;
   }
 
@@ -377,6 +392,9 @@ export async function processWorkspaceEntryAsync(
     await yieldToLoop();
   }
 
+  // Strip the heavy text from sessions added by this workspace immediately, so full-text
+  // does not accumulate across every workspace during a cold parse (issue #106).
+  stripSessionsFrom(sessions, startIdx);
   return wsName;
 }
 

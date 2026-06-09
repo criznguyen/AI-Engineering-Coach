@@ -114,12 +114,17 @@ function partitionDirs(logsDirs: string[]): { vsCodeDirs: string[]; xcodeDirs: s
 
 const PREFETCH_TIMEOUT_MS = 15_000;
 const MAX_PREFETCH_FILES = 600;
+// During a cold parse the growing sessions array competes with the prefetch buffer for heap.
+// Cap look-ahead lower so prefetch can't add hundreds of MB of file contents on top of the
+// session accumulation (issue #106). 100 still gives enough overlap for I/O pipelining.
+const COLD_PARSE_MAX_PREFETCH_FILES = 100;
 const MAX_PREFETCH_FILE_SIZE = 20 * 1024 * 1024;
 const WORKER_MAX_OLD_SPACE_MB = 4096;
 const RETRY_WORKER_MAX_OLD_SPACE_MB = 6144;
 
 async function prefetchBatch(
   workItems: { logsDir: string; wsId: string }[],
+  maxFiles: number = MAX_PREFETCH_FILES,
 ): Promise<void> {
   const filePaths: string[] = [];
 
@@ -130,7 +135,7 @@ async function prefetchBatch(
     try {
       const chatFiles = await fs.promises.readdir(path.join(wsPath, 'chatSessions'));
       for (const f of chatFiles) {
-        if (filePaths.length >= MAX_PREFETCH_FILES) break;
+        if (filePaths.length >= maxFiles) break;
         if (f.endsWith('.json') || f.endsWith('.jsonl')) {
           filePaths.push(path.join(wsPath, 'chatSessions', f));
         }
@@ -140,7 +145,7 @@ async function prefetchBatch(
     try {
       const editDirs = await fs.promises.readdir(path.join(wsPath, 'chatEditingSessions'));
       for (const d of editDirs) {
-        if (filePaths.length >= MAX_PREFETCH_FILES) break;
+        if (filePaths.length >= maxFiles) break;
         filePaths.push(path.join(wsPath, 'chatEditingSessions', d, 'state.json'));
       }
     } catch { /* no editDir */ }
@@ -305,7 +310,11 @@ async function processWorkspaces(
   totalDirs: number,
   ctx: ParseContext,
   onProgress?: ProgressCallback,
+  isColdParse = true,
 ): Promise<void> {
+  const effectiveMaxPrefetch = isColdParse
+    ? Math.min(COLD_PARSE_MAX_PREFETCH_FILES, MAX_PREFETCH_FILES)
+    : MAX_PREFETCH_FILES;
   const work: { logsDir: string; wsId: string; harness: string; mtime: number; workspaceKey: string; sessionTiles: Array<{ mtime: number; size: number; date?: string }> }[] = [];
   for (const { logsDir, dirEntries } of entries) {
     const harness = harnessFromPath(logsDir);
@@ -375,9 +384,9 @@ async function processWorkspaces(
       const batch = work.slice(i, i + BATCH_SIZE);
       const nextBatch = work.slice(i + BATCH_SIZE, i + BATCH_SIZE * 2);
 
-      if (i === 0) await prefetchBatch(batch);
+      if (i === 0) await prefetchBatch(batch, effectiveMaxPrefetch);
 
-      const nextPrefetch = nextBatch.length > 0 ? prefetchBatch(nextBatch) : Promise.resolve();
+      const nextPrefetch = nextBatch.length > 0 ? prefetchBatch(nextBatch, effectiveMaxPrefetch) : Promise.resolve();
 
       let lastWsName = '';
       for (const { logsDir, wsId, harness, workspaceKey } of batch) {

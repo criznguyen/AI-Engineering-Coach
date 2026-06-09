@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { runtimeDebug } from './runtime-debug';
 import { Workspace } from './types';
-import { ParseContext, prefetchCache } from './parser-shared';
+import { ParseContext, prefetchCache, stripSingleSession, maybeForceGc, recordFailedFile, resetParseWarnings, type ParseWarning } from './parser-shared';
 import { getMemoryCache, setMemoryCache, computeDirMetasAsync, loadCacheData, saveCacheData, findStaleDirs, clearCache, stripSessionsForMemory } from './cache';
 import type { DirMetas, ParseResult, SessionSource } from './cache';
 import { ChunkAssembler, type WorkerChunkPayload, type WorkerDonePayload } from './parse-chunking';
@@ -40,6 +40,32 @@ export interface LoadProgress {
   workspacePlan?: string[];
   /** Sent after each workspace is processed so the loading grid can mark it complete. */
   workspaceDone?: string;
+  /** Live runtime telemetry of the parse worker process (issue #106). Lets the loading UI
+   *  surface the resource pressure that drives parse load: heap, RSS, file buffers, CPU. */
+  telemetry?: ParseTelemetry;
+}
+
+/** A live snapshot of the parse worker's resource usage, surfaced on the loading screen. */
+export interface ParseTelemetry {
+  /** Resident set size (total process memory) in MB. */
+  rssMB: number;
+  /** V8 heap currently in use, in MB. */
+  heapUsedMB: number;
+  /** V8 heap ceiling (the `--max-old-space-size` cap) in MB; the OOM threshold. */
+  heapLimitMB: number;
+  /** Off-heap bytes — external + ArrayBuffers — in MB. This is dominated by the raw
+   *  session-file text held in memory while parsing, so it tracks load directly. */
+  fileBufMB: number;
+  /** Worker CPU utilization since the previous sample, as a percentage (0–100). */
+  cpuPct: number;
+  /** System free memory in MB. */
+  sysFreeMB: number;
+  /** System total memory in MB. */
+  sysTotalMB: number;
+  /** Count of files that failed to parse entirely so far (read error / no usable content). */
+  skippedFiles: number;
+  /** Count of malformed lines skipped inside otherwise-readable files so far. */
+  skippedLines: number;
 }
 
 export type ProgressCallback = (p: LoadProgress) => void;
@@ -120,12 +146,20 @@ const MAX_PREFETCH_FILES = 600;
 // session accumulation (issue #106). 100 still gives enough overlap for I/O pipelining.
 const COLD_PARSE_MAX_PREFETCH_FILES = 100;
 const MAX_PREFETCH_FILE_SIZE = 20 * 1024 * 1024;
+// Cap the *total* bytes a single prefetch batch may hold in `prefetchCache`. Capping by file
+// count alone is not enough: 100 files at up to 20 MB each is ~2 GB, and the next batch's
+// prefetch runs concurrently (double-buffered), so file text alone could approach ~4 GB on top
+// of the parse working set and OOM the worker (issue #106). A byte budget bounds the spike
+// regardless of how large individual session files are.
+const COLD_PARSE_MAX_PREFETCH_BYTES = 64 * 1024 * 1024;
+const MAX_PREFETCH_BYTES = 1024 * 1024 * 1024;
 const WORKER_MAX_OLD_SPACE_MB = 4096;
 const RETRY_WORKER_MAX_OLD_SPACE_MB = 6144;
 
 async function prefetchBatch(
   workItems: { logsDir: string; wsId: string }[],
   maxFiles: number = MAX_PREFETCH_FILES,
+  maxBytes: number = MAX_PREFETCH_BYTES,
 ): Promise<void> {
   const filePaths: string[] = [];
 
@@ -154,12 +188,29 @@ async function prefetchBatch(
 
   if (filePaths.length === 0) return;
 
-  const readPromise = Promise.allSettled(
+  // Stat first so we can enforce a total-byte budget before reading any content into memory.
+  const sized = await Promise.all(
     filePaths.map(async fp => {
       const stat = await fs.promises.stat(fp).catch(() => null);
-      if (!stat || stat.size > MAX_PREFETCH_FILE_SIZE) return;
-      const content = await fs.promises.readFile(fp, 'utf-8');
-      prefetchCache.set(fp, content);
+      return { fp, size: stat ? stat.size : -1 };
+    }),
+  );
+
+  let budget = maxBytes;
+  const toRead: string[] = [];
+  for (const { fp, size } of sized) {
+    if (size < 0 || size > MAX_PREFETCH_FILE_SIZE) continue;
+    if (size > budget) continue;
+    budget -= size;
+    toRead.push(fp);
+  }
+
+  if (toRead.length === 0) return;
+
+  const readPromise = Promise.allSettled(
+    toRead.map(async fp => {
+      const content = await fs.promises.readFile(fp, 'utf-8').catch(() => null);
+      if (content !== null) prefetchCache.set(fp, content);
     }),
   );
   await withTimeout(readPromise, PREFETCH_TIMEOUT_MS);
@@ -168,7 +219,22 @@ async function prefetchBatch(
 const BATCH_SIZE = 32;
 
 /** The worker's `done` message is the chunking done payload plus worker-only dir fingerprints. */
-type WorkerDoneMessagePayload = WorkerDonePayload & { dirMetas: DirMetas };
+type WorkerDoneMessagePayload = WorkerDonePayload & {
+  dirMetas: DirMetas;
+  parseWarnings?: ParseWarning[];
+  parseWarningCounts?: { skippedFiles: number; skippedLines: number };
+};
+
+/** Surface any files the worker could not parse to the "AI Engineer Coach" output channel, so a
+ *  silent partial parse becomes discoverable. runtimeDebug routes through the channel hook set up
+ *  in extension.ts (View → Output → "AI Engineer Coach"). */
+function logParseWarnings(warnings: ParseWarning[] | undefined): void {
+  if (!warnings || warnings.length === 0) return;
+  runtimeDebug('parser', 'parse-warnings', `${warnings.length} file(s) could not be parsed:`);
+  for (const w of warnings) {
+    runtimeDebug('parser', 'parse-warnings', `  [${w.scope}] ${w.file} — ${w.reason}`);
+  }
+}
 
 function toDateStr(ms: number): string {
   const d = new Date(ms);
@@ -309,6 +375,7 @@ async function processWorkspaces(
   const effectiveMaxPrefetch = isColdParse
     ? Math.min(COLD_PARSE_MAX_PREFETCH_FILES, MAX_PREFETCH_FILES)
     : MAX_PREFETCH_FILES;
+  const effectiveMaxPrefetchBytes = isColdParse ? COLD_PARSE_MAX_PREFETCH_BYTES : MAX_PREFETCH_BYTES;
   const work: { logsDir: string; wsId: string; harness: string; mtime: number; workspaceKey: string; sessionTiles: Array<{ mtime: number; size: number; date?: string }> }[] = [];
   for (const { logsDir, dirEntries } of entries) {
     const harness = harnessFromPath(logsDir);
@@ -351,6 +418,7 @@ async function processWorkspaces(
 
   let processed = 0;
   let lastLocIndex = 0;
+  let strippedUpTo = 0;
   let runningLoc = 0;
   let runningToolCalls = 0;
   let runningImages = 0;
@@ -378,9 +446,9 @@ async function processWorkspaces(
       const batch = work.slice(i, i + BATCH_SIZE);
       const nextBatch = work.slice(i + BATCH_SIZE, i + BATCH_SIZE * 2);
 
-      if (i === 0) await prefetchBatch(batch, effectiveMaxPrefetch);
+      if (i === 0) await prefetchBatch(batch, effectiveMaxPrefetch, effectiveMaxPrefetchBytes);
 
-      const nextPrefetch = nextBatch.length > 0 ? prefetchBatch(nextBatch, effectiveMaxPrefetch) : Promise.resolve();
+      const nextPrefetch = nextBatch.length > 0 ? prefetchBatch(nextBatch, effectiveMaxPrefetch, effectiveMaxPrefetchBytes) : Promise.resolve();
 
       let lastWsName = '';
       for (const { logsDir, wsId, harness, workspaceKey } of batch) {
@@ -400,13 +468,24 @@ async function processWorkspaces(
               requests: runningRequests,
             });
           });
-        } catch {
+        } catch (e) {
           lastWsName = wsId;
+          recordFailedFile('parser', logsDir, e);
         }
         const elapsed = Date.now() - start;
 
         // Incrementally compute stats from newly added sessions
         updateRunningStats();
+
+        // Eagerly strip the heavy text (responseText, oversized messageText) from sessions as
+        // soon as their stats are computed, instead of holding every session's full content in
+        // heap until the end of the cold parse. With large histories the all-at-once retention
+        // pushed the worker's RSS past Electron/Chromium's ~2GB allocator OOM ceiling, which
+        // hard-aborts the process (exit 0xE0000008) below the V8 heap limit and bypasses Node's
+        // fatal-error diagnostics (issue #106). The disk cache is serialized from the already
+        // stripped sessions, so this changes peak memory only — not the parsed result.
+        for (let si = strippedUpTo; si < ctx.sessions.length; si++) stripSingleSession(ctx.sessions[si]);
+        strippedUpTo = ctx.sessions.length;
 
         processed++;
         await reportWorkspaceProgress(onProgress, processed, totalDirs, lastWsName, elapsed, ctx.sessions.length, workspaceKey, runningLoc, runningToolCalls, runningImages, runningFilesEdited, runningRequests);
@@ -414,6 +493,9 @@ async function processWorkspaces(
 
       await nextPrefetch;
       await yieldToLoop();
+      // Backstop: reclaim any transient batch garbage before reading the next batch, keeping RSS
+      // under Electron's ~2GB allocator OOM ceiling during large cold parses (issue #106).
+      maybeForceGc();
     }
   } finally {
     prefetchCache.clear();
@@ -501,6 +583,10 @@ export async function parseAllLogsAsyncDetailed(
   const report: ReportProgress = (p) => {
     if (onProgress) onProgress({ detail: '', pct: pct(p.phase, 0), sessions: 0, ...p });
   };
+
+  // Clear any warnings from a previous parse in this process (the worker is fresh per run, but
+  // the in-process path can be invoked repeatedly).
+  resetParseWarnings();
 
   report({ phase: 1, detail: 'Computing directory fingerprints' });
   await yieldToLoop();
@@ -647,8 +733,12 @@ export async function parseAllLogsViaWorker(
       let child: import('child_process').ChildProcess;
       try {
         child = forkFn(workerPath, [], {
-          execArgv: [`--max-old-space-size=${maxOldSpaceMb}`],
-          stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+          execArgv: [
+            `--max-old-space-size=${maxOldSpaceMb}`,
+            // Expose global.gc so the worker can proactively reclaim transient parse garbage
+            // before RSS reaches Electron's ~2GB allocator OOM ceiling (issue #106).
+            '--expose-gc',
+          ],
         });
       } catch {
         runtimeDebug('parser', 'child-constructor-failed', `attempt=${attempt}`);
@@ -680,7 +770,7 @@ export async function parseAllLogsViaWorker(
         fail('parse worker timeout (10m)');
       }, TIMEOUT_MS);
 
-      child.on('message', (msg: { type: 'progress'; progress: LoadProgress } | { type: 'chunk'; payload: WorkerChunkPayload } | { type: 'done'; payload: WorkerDoneMessagePayload } | { type: 'error'; message?: string }) => {
+      child.on('message', (msg: { type: 'progress'; progress: LoadProgress } | { type: 'chunk'; seq: number; payload: WorkerChunkPayload } | { type: 'done'; payload: WorkerDoneMessagePayload } | { type: 'error'; message?: string }) => {
         if (msg.type === 'progress') {
           if (msg.progress.phase !== lastPhase) {
             lastPhase = msg.progress.phase;
@@ -701,18 +791,28 @@ export async function parseAllLogsViaWorker(
 
         if (msg.type === 'chunk') {
           assembler.addChunk(msg.payload);
+          // Ack so the worker can release its in-flight window and emit the next chunk. Without
+          // this backpressure the worker flushed the whole result into its native IPC buffer and
+          // aborted with a native OOM (issue #106).
+          try {
+            child.send({ type: 'ack', seq: msg.seq });
+          } catch {
+            // Child already gone; the exit handler will settle the attempt.
+          }
           return;
         }
 
         if (msg.type === 'done') {
           const assembled = assembler.finish(msg.payload);
           runtimeDebug('parser', 'child-done', `attempt=${attempt} chunks=${assembler.chunkCount} workspaces=${msg.payload.workspaces.length} sessions=${assembled.sessions.length}`);
+          logParseWarnings(msg.payload.parseWarnings);
           finish(() => {
             const result: ParseResult = {
               workspaces: assembled.workspaces,
               sessions: assembled.sessions,
               editLocIndex: assembled.editLocIndex,
               sessionSourceIndex: assembled.sessionSourceIndex,
+              parseWarnings: msg.payload.parseWarningCounts ?? { skippedFiles: 0, skippedLines: 0 },
             };
             setMemoryCache(result, msg.payload.dirMetas);
             // Child already sent the stripped representation, but keep this idempotent.

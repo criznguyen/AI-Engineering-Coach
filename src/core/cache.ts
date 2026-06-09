@@ -24,6 +24,9 @@ export interface ParseResult {
   sessions: Session[];
   editLocIndex: Map<string, Map<string, number>>;
   sessionSourceIndex: Map<string, SessionSource>;
+  /** Counts of session files / lines the parser had to skip. Surfaced as a post-load banner so a
+   *  partial parse is discoverable. Absent on cold disk-cache restores (no parse ran). */
+  parseWarnings?: { skippedFiles: number; skippedLines: number };
 }
 
 export interface SessionSource {

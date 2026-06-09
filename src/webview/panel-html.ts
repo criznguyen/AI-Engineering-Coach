@@ -58,7 +58,9 @@ export function getDashboardHtml(webview: vscode.Webview, extensionUri: vscode.U
       </div>
     </div>
   </nav>
-  <main id="content"></main>
+  <div id="content-col">
+    <main id="content"></main>
+  </div>
 </div>
 <script nonce="${nonce}" src="${String(scriptUri)}"></script>
 </body>

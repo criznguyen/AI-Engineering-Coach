@@ -32,6 +32,9 @@ function mb(bytes: number): string { return `${(bytes / (1024 * 1024)).toFixed(1
 async function main(): Promise<void> {
   const targetGb = Number(process.env.OOM_TARGET_GB ?? '1.5');
   const heapMb = Number(process.env.OOM_HEAP_MB ?? '4096');
+  // Optional: shape large individual session files (mimics histories with a few huge sessions,
+  // which stress the prefetch buffer / per-workspace transient — issue #106).
+  const bytesPerRequest = process.env.OOM_BYTES_PER_REQUEST ? Number(process.env.OOM_BYTES_PER_REQUEST) : undefined;
 
   const workerPath = path.join(process.cwd(), 'dist', 'parse-worker.js');
   if (!fs.existsSync(workerPath)) {
@@ -43,7 +46,7 @@ async function main(): Promise<void> {
 
   console.log(`Generating ~${targetGb} GB synthetic tree...`);
   const t0 = Date.now();
-  const gen = generateSyntheticLogs(planForTargetGb(targetGb));
+  const gen = generateSyntheticLogs(planForTargetGb(targetGb, bytesPerRequest));
   console.log(`  ${gen.totalSessions} sessions, ${mb(gen.approxBytesOnDisk)} on disk in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   console.log(`  root: ${gen.root}`);
   console.log(`Forking worker with --max-old-space-size=${heapMb}...`);

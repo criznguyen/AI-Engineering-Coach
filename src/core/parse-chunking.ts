@@ -40,12 +40,17 @@ type ChunkableResult = Pick<ParseResult, 'sessions' | 'editLocIndex' | 'sessionS
  * editLocIndex / sessionSourceIndex entries travel with the chunk that owns their sessions;
  * anything left over (edits with no matching chat request, or sources for sessions that were
  * filtered out) is returned in the done payload so nothing is dropped.
+ *
+ * `onChunk` may return a promise; emit awaits it before producing the next chunk. The worker
+ * uses this to apply IPC backpressure (await an ack window) so serialized chunks cannot pile up
+ * in the child's native write buffer — the native OOM abort that V8 heap limits could not catch
+ * (issue #106).
  */
-export function emitResultChunks(
+export async function emitResultChunks(
   result: ChunkableResult,
-  onChunk: (chunk: WorkerChunkPayload) => void,
+  onChunk: (chunk: WorkerChunkPayload) => void | Promise<void>,
   chunkSize: number = DEFAULT_SESSION_CHUNK_SIZE,
-): WorkerDonePayload {
+): Promise<WorkerDonePayload> {
   const size = chunkSize > 0 ? chunkSize : DEFAULT_SESSION_CHUNK_SIZE;
   const emittedEditLocKeys = new Set<string>();
   const emittedSessionIds = new Set<string>();
@@ -67,7 +72,7 @@ export function emitResultChunks(
         }
       }
     }
-    onChunk({ sessions: slice, editLocEntries, sourceEntries });
+    await onChunk({ sessions: slice, editLocEntries, sourceEntries });
   }
 
   const orphanEditLoc: WorkerDonePayload['orphanEditLoc'] = [];

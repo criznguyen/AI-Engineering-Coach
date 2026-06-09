@@ -8,10 +8,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Session, SessionRequest, ToolConfirmation } from './types';
-import { createRequest, createSession, detectDevcontainerFromRequests, extractSkillNameFromPath, ParseContext, prefetchCache, stripSingleSession } from './parser-shared';
+import { createRequest, createSession, detectDevcontainerFromRequests, extractSkillNameFromPath, ParseContext, prefetchCache, stripSingleSession, maybeForceGc } from './parser-shared';
 import { debugCore, warnCore } from './log';
 import { canonicalizeReasoningEffort, extractReasoningEffortFromModelId } from './helpers';
-import { parseCLIEventsFile } from './parser-vscode-cli';
+import { parseCLIEventsFile, parseCLIEventsFileAsync } from './parser-vscode-cli';
 import { parseCLIWorkspaceName, parseWorkspaceName, parseWorkspaceFolderPath, parseCLIWorkspaceFolderPath, readFile, reconstructFromJsonl, stripImageData } from './parser-vscode-files';
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -317,7 +317,23 @@ export async function processWorkspaceEntryAsync(
 
   if (isCLI) {
     const eventsFile = path.join(entryPath, 'events.jsonl');
-    const cliSession = parseCLIEventsFile(eventsFile, wsId, wsName, customInstructionsBytes);
+    // Stream the events file asynchronously with byte progress, so a multi-GB events.jsonl keeps
+    // the worker responsive and advances the host progress bar instead of freezing it (issue #106).
+    const cliSession = await parseCLIEventsFileAsync(
+      eventsFile,
+      wsId,
+      wsName,
+      customInstructionsBytes,
+      (bytesRead, totalBytes) => {
+        const total = Math.max(1, totalBytes);
+        onProgress?.({
+          wsName,
+          detail: `events.jsonl ${Math.round((bytesRead / total) * 100)}%`,
+          completed: bytesRead,
+          total,
+        });
+      },
+    );
     if (cliSession) {
       sessions.push(cliSession);
       sessionSourceIndex.set(cliSession.sessionId, {
@@ -342,6 +358,9 @@ export async function processWorkspaceEntryAsync(
   for (let i = 0; i < chatFiles.length; i++) {
     const session = parseSessionFile(chatFiles[i], wsId, wsName, harness, customInstructionsBytes);
     if (session) {
+      // Strip heavy text the moment a session is parsed so a workspace with many large
+      // sessions can't accumulate its full text before the workspace finishes (issue #106).
+      stripSingleSession(session);
       sessions.push(session);
       sessionSourceIndex.set(session.sessionId, {
         kind: 'vscode-session-file',
@@ -363,11 +382,15 @@ export async function processWorkspaceEntryAsync(
     // Always yield after each file to keep the event loop responsive,
     // especially for workspaces with many large session files.
     await yieldToLoop();
+    // Reclaim the file's transient parse garbage (raw text, split arrays, per-line JSON) before
+    // the next file, so RSS stays under Electron's ~2GB allocator OOM ceiling (issue #106).
+    maybeForceGc();
   }
 
   const eventsFile = path.join(entryPath, 'events.jsonl');
   const cliSession = parseCLIEventsFile(eventsFile, wsId, wsName, customInstructionsBytes);
   if (cliSession) {
+    stripSingleSession(cliSession);
     sessions.push(cliSession);
     sessionSourceIndex.set(cliSession.sessionId, {
       kind: 'cli-events',

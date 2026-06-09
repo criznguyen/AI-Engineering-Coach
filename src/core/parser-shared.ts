@@ -97,6 +97,84 @@ export function readFileSafe(filePath: string): string | null {
 /** Shared prefetch cache: file path -> contents. Populated async, consumed sync by parsers. */
 export const prefetchCache = new Map<string, string>();
 
+/* ---- Parse-warning collector ----
+ * Parsers are intentionally resilient: a malformed JSONL line is skipped and an unreadable file
+ * returns null rather than aborting the whole parse. That resilience used to be silent, so a
+ * file that failed to parse simply produced fewer sessions with no trace in the UI. This
+ * collector records those events so the worker can (a) surface live counts in the loading
+ * telemetry and (b) ship the full failed-file list to the host for the "AI Engineer Coach"
+ * output channel. */
+
+/** A single file that could not be parsed (read error or no usable content). */
+export interface ParseWarning {
+  /** Path of the file that failed. */
+  file: string;
+  /** Originating parser scope, e.g. `parser-vscode`. */
+  scope: string;
+  /** Human-readable reason (error message). */
+  reason: string;
+}
+
+/** Cap on the stored failed-file detail list so a pathological run cannot grow memory unbounded.
+ *  Counts keep incrementing past the cap; only the detail array is bounded. */
+const MAX_PARSE_WARNINGS = 500;
+const parseWarnings: ParseWarning[] = [];
+let failedFileCount = 0;
+let skippedLineCount = 0;
+
+/** Record a file that failed to parse entirely (read error, or produced no usable content). */
+export function recordFailedFile(scope: string, file: string, reason: unknown): void {
+  failedFileCount++;
+  if (parseWarnings.length < MAX_PARSE_WARNINGS) {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    parseWarnings.push({ file, scope, reason: msg });
+  }
+}
+
+/** Record one (or more) malformed lines skipped inside an otherwise-readable file. */
+export function recordSkippedLines(count = 1): void {
+  skippedLineCount += count;
+}
+
+/** Live counts for the loading telemetry strip. */
+export function getParseWarningCounts(): { skippedFiles: number; skippedLines: number } {
+  return { skippedFiles: failedFileCount, skippedLines: skippedLineCount };
+}
+
+/** Full failed-file detail list (bounded by MAX_PARSE_WARNINGS), shipped to the host. */
+export function getParseWarnings(): ParseWarning[] {
+  return parseWarnings.slice();
+}
+
+/** Reset all warning state. Called at the start of each parse so counts never carry across runs
+ *  (the worker is a fresh process, but the in-process path can parse repeatedly). */
+export function resetParseWarnings(): void {
+  parseWarnings.length = 0;
+  failedFileCount = 0;
+  skippedLineCount = 0;
+}
+
+/* ---- Transient-memory guard (issue #106) ----
+ * The parse worker runs inside Electron's embedded V8, whose allocator hard-aborts the process
+ * (exit 0xE0000008, no stderr, no Node report) once RSS approaches ~2 GB — well below the V8
+ * heap limit. Cold-parsing a large history produces big *transient* garbage (raw file text,
+ * raw.split('\n') arrays, per-line JSON.parse objects) that Electron's GC does not reclaim
+ * eagerly enough, so RSS crosses that ceiling before a natural GC. The live set is small, so
+ * proactively forcing a GC when RSS is high keeps the process safely under the ceiling.
+ * Requires the worker to be launched with --expose-gc; it is a no-op otherwise. */
+let lastForcedGcAt = 0;
+const FORCE_GC_RSS_THRESHOLD = 1024 * 1024 * 1024; // 1 GB
+const FORCE_GC_MIN_INTERVAL_MS = 200;
+export function maybeForceGc(): void {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (!gc) return;
+  const now = Date.now();
+  if (now - lastForcedGcAt < FORCE_GC_MIN_INTERVAL_MS) return;
+  if (process.memoryUsage().rss < FORCE_GC_RSS_THRESHOLD) return;
+  lastForcedGcAt = now;
+  try { gc(); } catch { /* gc unavailable */ }
+}
+
 export const CODE_BLOCK_RE = /```(\w+)?\n([\s\S]*?)```/g;
 
 const MAX_STORED_MESSAGE_CHARS = 16_000;

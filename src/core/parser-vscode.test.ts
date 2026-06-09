@@ -762,11 +762,7 @@ describe('harnessFromPath — VS Code Server', () => {
 });
 
 describe('findVsCodeDirs — VS Code Server', () => {
-  // findVsCodeDirs derives edition paths from %APPDATA% on Windows and skips the
-  // .vscode-server lookup entirely there, so this HOME-redirected fixture only
-  // models non-Windows discovery. Skip on win32 to avoid reading the real machine's
-  // APPDATA dirs (CI runs on ubuntu-latest, where this still executes).
-  it.skipIf(process.platform === 'win32')('includes server workspaceStorage paths on non-Windows hosts', () => {
+  it('includes server workspaceStorage paths on non-Windows hosts', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-engineer-coach-vscode-'));
     const home = process.env.HOME;
     const userProfile = process.env.USERPROFILE;

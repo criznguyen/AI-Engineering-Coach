@@ -6,7 +6,8 @@
 /* Webview entry -- runs in the browser context inside the VS Code webview */
 
 import { AntiPatternData, DateFilter, StatsResult } from '../core/types';
-import { $, $$, rpc, destroyCharts, initMessageListener, withErrorBoundary } from './shared';
+import { $, $$, rpc, destroyCharts, initMessageListener, withErrorBoundary, type WorkerTelemetry } from './shared';
+import { updateTelemetry } from './telemetry-strip';
 import { html, render, unmount, ComponentChildren } from './render';
 import { renderDashboard } from './page-dashboard';
 import { renderPatterns } from './page-patterns';
@@ -39,6 +40,10 @@ let currentPage = 'dashboard';
 const currentFilter: DateFilter = {};
 let _dataIsReady = false;
 let matchedWorkspaceId: string | undefined;
+
+/** Last parse-warning counts seen in worker telemetry, used to surface a post-load banner. */
+let lastSkippedFiles = 0;
+let lastSkippedLines = 0;
 
 /** Navigation hint: which sub-section to auto-open after navigating */
 export let navHint: string | undefined;
@@ -111,6 +116,7 @@ function ensureLoadingUI(): void {
       <div class="loading-tile-vignette"></div>
       <div class="loading-card-wrap">
         <div class="loading-status-card">
+          <div class="loading-telemetry" id="loading-telemetry"></div>
           <div class="loading-status-head">
             <div class="loading-hero">
               <div class="loading-kicker">Building Activity Index</div>
@@ -353,11 +359,16 @@ function updatePhaseChecklist(currentPhase: number): void {
 }
 
 /** Update UI based on progress message */
-function handleProgress(msg: { phase: number; detail?: string; pct: number; sessions?: number; linesOfCode?: number; toolCalls?: number; imagesAnalyzed?: number; filesEdited?: number; requests?: number; workspacePlan?: string[]; workspaceDone?: string }): void {
+function handleProgress(msg: { phase: number; detail?: string; pct: number; sessions?: number; linesOfCode?: number; toolCalls?: number; imagesAnalyzed?: number; filesEdited?: number; requests?: number; workspacePlan?: string[]; workspaceDone?: string; telemetry?: WorkerTelemetry }): void {
   ensureLoadingUI();
   const phase = PHASE_LABELS[msg.phase] ?? `Phase ${msg.phase}`;
   const detail = msg.detail ?? '';
 
+  if (msg.telemetry) updateTelemetry(msg.telemetry);
+  if (msg.telemetry) {
+    lastSkippedFiles = msg.telemetry.skippedFiles ?? lastSkippedFiles;
+    lastSkippedLines = msg.telemetry.skippedLines ?? lastSkippedLines;
+  }
   if (msg.workspacePlan) renderWorkspaceGrid(msg.workspacePlan);
   if (msg.workspaceDone) updateWorkspaceCell(msg.workspaceDone, msg.detail);
 
@@ -417,8 +428,14 @@ function handleProgress(msg: { phase: number; detail?: string; pct: number; sess
   updatePhaseChecklist(msg.phase);
 }
 
-function onDataReady(currentWorkspace: string): void {
+function onDataReady(currentWorkspace: string, skipped?: { skippedFiles: number; skippedLines: number }): void {
   _dataIsReady = true;
+  // Prefer the authoritative counts sent with `dataReady` (present even on a cache hit, where no
+  // progress telemetry tick ever fires); fall back to whatever a telemetry tick captured.
+  if (skipped) {
+    if (skipped.skippedFiles > 0) lastSkippedFiles = skipped.skippedFiles;
+    if (skipped.skippedLines > 0) lastSkippedLines = skipped.skippedLines;
+  }
   clearInterval(elapsedTimerId);
   setShellLoadingMode(false);
   void rpc<{ id: string; name: string; recent?: boolean; harnesses?: string[] }[]>('getWorkspaces').then((wss) => {
@@ -443,6 +460,51 @@ function onDataReady(currentWorkspace: string): void {
 
   navigateTo(currentPage);
   refreshNavBadges(currentFilter);
+  maybeShowSkippedBanner();
+}
+
+/** After load, if any session files failed to parse, show a compact, dismissible notice above the
+ *  page so the partial result is discoverable. A "View details" link reveals the "AI Engineer
+ *  Coach" output channel with the full per-file breakdown. The notice lives in #content-col above
+ *  #content, so it spans the content column and survives page navigation. */
+function maybeShowSkippedBanner(): void {
+  if (lastSkippedFiles <= 0) return;
+  if (document.getElementById('skipped-banner')) return;
+  const content = document.getElementById('content');
+  const col = document.getElementById('content-col');
+  if (!content || !col) return;
+
+  const fileLabel = `${lastSkippedFiles} file${lastSkippedFiles === 1 ? '' : 's'}`;
+  const lineLabel = lastSkippedLines > 0 ? `, ${lastSkippedLines} line${lastSkippedLines === 1 ? '' : 's'}` : '';
+
+  const banner = document.createElement('div');
+  banner.id = 'skipped-banner';
+  banner.className = 'skipped-banner';
+  banner.setAttribute('role', 'status');
+
+  const icon = document.createElement('span');
+  icon.className = 'skipped-banner-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = '⚠';
+
+  const text = document.createElement('span');
+  text.className = 'skipped-banner-text';
+  text.textContent = `Some history was skipped while parsing (${fileLabel}${lineLabel}). Results may be incomplete.`;
+
+  const details = document.createElement('button');
+  details.className = 'skipped-banner-link';
+  details.type = 'button';
+  details.textContent = 'View details';
+  details.addEventListener('click', () => { void rpc('showOutput'); });
+
+  const dismiss = document.createElement('button');
+  dismiss.className = 'skipped-banner-dismiss';
+  dismiss.setAttribute('aria-label', 'Dismiss');
+  dismiss.textContent = '×';
+  dismiss.addEventListener('click', () => banner.remove());
+
+  banner.append(icon, text, details, dismiss);
+  col.insertBefore(banner, content);
 }
 
 initMessageListener(handleProgress, onDataReady);

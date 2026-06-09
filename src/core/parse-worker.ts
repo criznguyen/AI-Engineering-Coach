@@ -12,7 +12,9 @@ import { parentPort } from 'worker_threads';
 import { stripSessionsForMemory } from './cache';
 import { emitResultChunks, DEFAULT_SESSION_CHUNK_SIZE } from './parse-chunking';
 import { parseAllLogsAsyncDetailed, type LoadProgress } from './parser';
+import { getParseWarningCounts, getParseWarnings } from './parser-shared';
 import { installRuntimeDebugHooks, runtimeDebug } from './runtime-debug';
+import { createTelemetrySampler } from './worker-telemetry';
 
 interface ParseWorkerRequest {
   logsDirs?: string[];
@@ -20,6 +22,12 @@ interface ParseWorkerRequest {
 
 /** Number of sessions per streamed IPC chunk (issue #106, S1). */
 const SESSION_CHUNK_SIZE = DEFAULT_SESSION_CHUNK_SIZE;
+
+/** Max unacked chunks allowed in flight before the worker pauses emitting (issue #106). This
+ *  bounds how many serialized chunks can sit in the child's native IPC write buffer, preventing
+ *  the native (off-heap) OOM abort that a busy/slow parent triggered when the whole result was
+ *  flushed at once. */
+const CHUNK_ACK_WINDOW = 4;
 
 interface ProgressMessage {
   type: 'progress';
@@ -49,19 +57,53 @@ function parseWorkerRequest(msg: unknown): ParseWorkerRequest {
   };
 }
 
-function onMessage(handler: (msg: ParseWorkerRequest) => void | Promise<void>): void {
-  if (port) {
-    port.on('message', (msg) => {
-      void handler(parseWorkerRequest(msg));
-    });
-    return;
-  }
-  process.on('message', (msg) => {
-    void handler(parseWorkerRequest(msg));
-  });
+/** Parent -> worker chunk acknowledgement (issue #106). Routed away from the request handler so
+ *  it never re-triggers a parse. */
+interface AckMessage { type: 'ack'; seq: number }
+function isAckMessage(msg: unknown): msg is AckMessage {
+  return (
+    typeof msg === 'object' && msg !== null &&
+    (msg as { type?: unknown }).type === 'ack' &&
+    typeof (msg as { seq?: unknown }).seq === 'number'
+  );
 }
 
+/** Set by the streaming step to receive chunk acks from the parent. */
+let onAck: ((seq: number) => void) | null = null;
+
+function onMessage(handler: (msg: ParseWorkerRequest) => void | Promise<void>): void {
+  const dispatch = (raw: unknown): void => {
+    if (isAckMessage(raw)) {
+      onAck?.(raw.seq);
+      return;
+    }
+    void handler(parseWorkerRequest(raw));
+  };
+  if (port) {
+    port.on('message', dispatch);
+    return;
+  }
+  process.on('message', dispatch);
+}
+
+/** Build a live telemetry snapshot of this worker for the loading UI (issue #106). The CPU-delta
+ *  state lives inside the sampler; see worker-telemetry.ts for the (unit-tested) math. */
+const sampleTelemetry = createTelemetrySampler({ warningCounts: () => getParseWarningCounts() });
+
 onMessage(async (msg) => {
+  let lastProgress: LoadProgress | null = null;
+  // Periodically refresh telemetry even if the parse loop goes quiet during a single large
+  // workspace, so the loading screen's resource gauges keep ticking (issue #106).
+  const memTimer = setInterval(() => {
+    if (lastProgress) {
+      // Resend the last phase/pct with fresh telemetry only; drop one-shot grid fields so the
+      // refresh never replays workspace-plan / workspace-done side effects in the UI.
+      const { workspacePlan: _wp, workspaceDone: _wd, ...rest } = lastProgress;
+      void _wp; void _wd;
+      send({ type: 'progress', progress: { ...rest, telemetry: sampleTelemetry() } });
+    }
+  }, 500);
+  memTimer.unref?.();
   try {
     const logsDirs = Array.isArray(msg.logsDirs) ? msg.logsDirs : [];
     runtimeDebug('parse-worker', 'message-start', `logsDirs=${logsDirs.length}`);
@@ -80,6 +122,8 @@ onMessage(async (msg) => {
     };
 
     const { result, dirMetas } = await parseAllLogsAsyncDetailed(logsDirs, (progress) => {
+      progress.telemetry = sampleTelemetry();
+      lastProgress = progress;
       const progressMessage: ProgressMessage = { type: 'progress', progress };
       const now = Date.now();
       // Always send immediately for phase changes, workspace grid updates, or >= 100%.
@@ -112,11 +156,37 @@ onMessage(async (msg) => {
     // Stream the result to the parent in per-session-batch chunks (issue #106, S1). See
     // parse-chunking.ts for the emit/assemble contract; orphan edit/source entries are
     // returned in `done` so nothing is dropped.
-    const done = emitResultChunks(
+    //
+    // Backpressure (issue #106): the parent acks each chunk; the worker keeps at most
+    // CHUNK_ACK_WINDOW chunks unacked so serialized payloads cannot accumulate in the child's
+    // native IPC write buffer (the native OOM that V8 heap limits could not prevent).
+    let nextSeq = 0;
+    let highestAcked = -1;
+    let ackWaiter: (() => void) | null = null;
+    onAck = (seq) => {
+      if (seq > highestAcked) highestAcked = seq;
+      const resume = ackWaiter;
+      ackWaiter = null;
+      resume?.();
+    };
+
+    const done = await emitResultChunks(
       result,
-      (chunk) => send({ type: 'chunk', payload: chunk }),
+      async (chunk) => {
+        const seq = nextSeq++;
+        send({ type: 'chunk', seq, payload: chunk });
+        // Backpressure applies only to the child-process IPC channel, where unflushed chunks
+        // accumulate in a native write buffer. The worker_threads path posts into the parent's
+        // heap instead and never acks, so waiting there would deadlock (issue #106).
+        if (port) return;
+        // Pause while the window is full; each ack from the parent re-checks the condition.
+        while (seq - highestAcked >= CHUNK_ACK_WINDOW) {
+          await new Promise<void>((resolve) => { ackWaiter = resolve; });
+        }
+      },
       SESSION_CHUNK_SIZE,
     );
+    onAck = null;
 
     send({
       type: 'done',
@@ -125,6 +195,8 @@ onMessage(async (msg) => {
         orphanEditLoc: done.orphanEditLoc,
         orphanSources: done.orphanSources,
         dirMetas,
+        parseWarnings: getParseWarnings(),
+        parseWarningCounts: getParseWarningCounts(),
       },
     });
   } catch (e) {
@@ -133,5 +205,7 @@ onMessage(async (msg) => {
       type: 'error',
       message: e instanceof Error ? e.message : String(e),
     });
+  } finally {
+    clearInterval(memTimer);
   }
 });

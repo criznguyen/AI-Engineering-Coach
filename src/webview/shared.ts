@@ -50,9 +50,22 @@ export async function rpcAllSettled<T extends readonly unknown[]>(
   ) as unknown as T;
 }
 
+/** Live runtime telemetry of the parse worker (issue #106), surfaced on the loading screen. */
+export interface WorkerTelemetry {
+  rssMB: number;
+  heapUsedMB: number;
+  heapLimitMB: number;
+  fileBufMB: number;
+  cpuPct: number;
+  sysFreeMB: number;
+  sysTotalMB: number;
+  skippedFiles?: number;
+  skippedLines?: number;
+}
+
 export function initMessageListener(
-  onProgress: (msg: { phase: number; detail?: string; pct: number; sessions?: number; linesOfCode?: number; toolCalls?: number; imagesAnalyzed?: number; filesEdited?: number; requests?: number; workspacePlan?: string[]; workspaceDone?: string }) => void,
-  onDataReady: (currentWorkspace: string) => void,
+  onProgress: (msg: { phase: number; detail?: string; pct: number; sessions?: number; linesOfCode?: number; toolCalls?: number; imagesAnalyzed?: number; filesEdited?: number; requests?: number; workspacePlan?: string[]; workspaceDone?: string; telemetry?: WorkerTelemetry }) => void,
+  onDataReady: (currentWorkspace: string, skipped?: { skippedFiles: number; skippedLines: number }) => void,
 ): void {
   window.addEventListener('message', (ev) => {
     const msg = ev.data as Record<string, unknown>;
@@ -78,10 +91,14 @@ export function initMessageListener(
         requests: msg.requests as number | undefined,
         workspacePlan: msg.workspacePlan as string[] | undefined,
         workspaceDone: msg.workspaceDone as string | undefined,
+        telemetry: msg.telemetry as WorkerTelemetry | undefined,
       });
     }
     if (msg.type === 'dataReady') {
-      onDataReady(msg.currentWorkspace as string);
+      onDataReady(msg.currentWorkspace as string, {
+        skippedFiles: (msg.skippedFiles as number | undefined) ?? 0,
+        skippedLines: (msg.skippedLines as number | undefined) ?? 0,
+      });
     }
   });
 }

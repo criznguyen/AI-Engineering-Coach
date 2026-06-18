@@ -154,13 +154,13 @@ declare global {
 // Conservative backstop for the primary innerHTML sink. Input is already
 // auto-escaped by the `html` tagged template, so this never alters legitimate
 // rendering. If a future `rawHtml()` misuse pushed a literal <script> or a
-// javascript: URL through, neutralize it (render inert) rather than throw —
+// javascript:/vbscript:/data: URL through, neutralize it (render inert) rather than throw —
 // throwing would blank the whole element (denial of rendering) on benign text
 // that merely contains "javascript:" (e.g. an error message). Event-handler
 // attributes are handled by the SVG-only `default` policy in render.ts.
 const htmlPolicy = window.trustedTypes?.createPolicy('coach-html', {
   createHTML: (s: string) =>
-    s.replace(/<(\/?script)/gi, '&lt;$1').replace(/javascript:/gi, 'javascript&#58;'),
+    s.replaceAll(/<(\/?script)/gi, '&lt;$1').replaceAll(/(javascript|vbscript|data):/gi, '$1&#58;'),
 });
 
 /**

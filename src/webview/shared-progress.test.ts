@@ -40,8 +40,6 @@ describe('initMessageListener progress forwarding', () => {
       heapLimitMB: 4096,
       fileBufMB: 90,
       cpuPct: 55,
-      sysFreeMB: 4000,
-      sysTotalMB: 16000,
     };
 
     dispatch({

@@ -57,10 +57,6 @@ export interface ParseTelemetry {
   fileBufMB: number;
   /** Worker CPU utilization since the previous sample, as a percentage (0–100). */
   cpuPct: number;
-  /** System free memory in MB. */
-  sysFreeMB: number;
-  /** System total memory in MB. */
-  sysTotalMB: number;
   /** Count of files that failed to parse entirely so far (read error / no usable content). */
   skippedFiles: number;
   /** Count of malformed lines skipped inside otherwise-readable files so far. */

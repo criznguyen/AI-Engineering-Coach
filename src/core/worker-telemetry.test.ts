@@ -31,8 +31,6 @@ describe('createTelemetrySampler', () => {
       cpuUsage: () => ({ user: 0, system: 0 }),
       hrtimeNs: () => 0n,
       heapLimitBytes: () => 4096 * MB,
-      freeMemBytes: () => 8192 * MB,
-      totalMemBytes: () => 16384 * MB,
     });
 
     const t = sample();
@@ -40,8 +38,6 @@ describe('createTelemetrySampler', () => {
     expect(t.heapUsedMB).toBe(256);
     expect(t.heapLimitMB).toBe(4096);
     expect(t.fileBufMB).toBe(64); // external + arrayBuffers
-    expect(t.sysFreeMB).toBe(8192);
-    expect(t.sysTotalMB).toBe(16384);
   });
 
   it('reports 0% CPU on the first sample (no prior delta)', () => {
@@ -50,8 +46,6 @@ describe('createTelemetrySampler', () => {
       cpuUsage: () => ({ user: 1_000_000, system: 0 }),
       hrtimeNs: () => 1_000_000_000n,
       heapLimitBytes: () => 2048 * MB,
-      freeMemBytes: () => 0,
-      totalMemBytes: () => 0,
     });
     expect(sample().cpuPct).toBe(0);
   });
@@ -71,8 +65,6 @@ describe('createTelemetrySampler', () => {
       cpuUsage: () => cpuSeq[Math.min(ci++, cpuSeq.length - 1)],
       hrtimeNs: () => timeSeq[Math.min(ti++, timeSeq.length - 1)],
       heapLimitBytes: () => 4096 * MB,
-      freeMemBytes: () => 0,
-      totalMemBytes: () => 0,
     };
     const sample = createTelemetrySampler(sources); // seed (consumes cpuSeq[0], timeSeq[0])
 
@@ -93,8 +85,6 @@ describe('createTelemetrySampler', () => {
       cpuUsage: () => cpuSeq[Math.min(ci++, cpuSeq.length - 1)],
       hrtimeNs: () => timeSeq[Math.min(ti++, timeSeq.length - 1)],
       heapLimitBytes: () => 4096 * MB,
-      freeMemBytes: () => 0,
-      totalMemBytes: () => 0,
     });
     expect(sample().cpuPct).toBe(100);
   });
@@ -105,11 +95,9 @@ describe('createTelemetrySampler', () => {
       cpuUsage: () => ({ user: 0, system: 0 }),
       hrtimeNs: () => 0n,
       heapLimitBytes: () => 2048 * MB,
-      freeMemBytes: () => 1024 * MB,
-      totalMemBytes: () => 4096 * MB,
     });
     const t = sample();
-    for (const key of ['rssMB', 'heapUsedMB', 'heapLimitMB', 'fileBufMB', 'cpuPct', 'sysFreeMB', 'sysTotalMB'] as const) {
+    for (const key of ['rssMB', 'heapUsedMB', 'heapLimitMB', 'fileBufMB', 'cpuPct'] as const) {
       expect(typeof t[key]).toBe('number');
       expect(Number.isFinite(t[key])).toBe(true);
     }

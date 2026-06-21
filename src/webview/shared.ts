@@ -57,8 +57,6 @@ export interface WorkerTelemetry {
   heapLimitMB: number;
   fileBufMB: number;
   cpuPct: number;
-  sysFreeMB: number;
-  sysTotalMB: number;
   skippedFiles?: number;
   skippedLines?: number;
 }

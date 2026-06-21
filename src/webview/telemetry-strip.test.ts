@@ -20,8 +20,6 @@ const SAMPLE: WorkerTelemetry = {
   heapLimitMB: 4096,
   fileBufMB: 64,
   cpuPct: 42,
-  sysFreeMB: 8192,
-  sysTotalMB: 16384,
 };
 
 describe('telemetry-strip helpers', () => {
@@ -62,7 +60,6 @@ describe('updateTelemetry rendering', () => {
     expect(document.getElementById('tg-mem-limit')?.textContent).toBe('4.0 GB');
     expect(document.getElementById('tg-rss')?.textContent).toBe('512 MB');
     expect(document.getElementById('tg-buf')?.textContent).toBe('64 MB');
-    expect(document.getElementById('tg-sysfree')?.textContent).toBe('8.0 GB / 16 GB');
     // CPU label: 42% -> active
     expect(document.getElementById('tg-cpu-load')?.textContent).toBe('active');
   });

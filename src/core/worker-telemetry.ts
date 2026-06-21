@@ -11,7 +11,6 @@
  * CPU-delta state between calls; create one per worker run.
  */
 
-import * as os from 'os';
 import * as v8 from 'v8';
 import type { ParseTelemetry } from './parser';
 
@@ -24,8 +23,6 @@ export interface TelemetrySources {
   /** Monotonic time in nanoseconds (defaults to process.hrtime.bigint). */
   hrtimeNs: () => bigint;
   heapLimitBytes: () => number;
-  freeMemBytes: () => number;
-  totalMemBytes: () => number;
   /** Live parse-warning counts (failed files / skipped lines). */
   warningCounts: () => { skippedFiles: number; skippedLines: number };
 }
@@ -35,8 +32,6 @@ const defaultSources: TelemetrySources = {
   cpuUsage: (previous) => process.cpuUsage(previous),
   hrtimeNs: () => process.hrtime.bigint(),
   heapLimitBytes: () => v8.getHeapStatistics().heap_size_limit,
-  freeMemBytes: () => os.freemem(),
-  totalMemBytes: () => os.totalmem(),
   warningCounts: () => ({ skippedFiles: 0, skippedLines: 0 }),
 };
 
@@ -48,9 +43,8 @@ export function createTelemetrySampler(sources: Partial<TelemetrySources> = {}):
   const s: TelemetrySources = { ...defaultSources, ...sources };
   const mb = (n: number): number => Math.round(n / BYTES_PER_MB);
 
-  // Constants read once — the heap ceiling and total RAM do not change during a run.
+  // Constant read once — the heap ceiling does not change during a run.
   const heapLimitMB = mb(s.heapLimitBytes());
-  const sysTotalMB = mb(s.totalMemBytes());
 
   let lastCpu = s.cpuUsage();
   let lastAt = s.hrtimeNs();
@@ -74,8 +68,6 @@ export function createTelemetrySampler(sources: Partial<TelemetrySources> = {}):
       heapLimitMB,
       fileBufMB: mb(m.external + m.arrayBuffers),
       cpuPct: Math.round(cpuPct),
-      sysFreeMB: mb(s.freeMemBytes()),
-      sysTotalMB,
       ...s.warningCounts(),
     };
   };

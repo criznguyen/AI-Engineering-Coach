@@ -39,12 +39,8 @@ test.describe('Loading telemetry strip (issue #106)', () => {
     expect(cpu?.toLowerCase()).toContain('busy');
   });
 
-  test('populates RSS, buffer, and system memory tiles', async ({ page }) => {
+  test('populates RSS and buffer tiles', async ({ page }) => {
     expect(await page.textContent('#tg-rss')).toContain('1.5 GB'); // rssMB 1536
     expect(await page.textContent('#tg-buf')).toContain('320 MB'); // fileBufMB 320
-    // sysFreeMB 6144 (→ 6.0 GB) / sysTotalMB 16384 (→ 16 GB).
-    const sys = await page.textContent('#tg-sysfree');
-    expect(sys).toContain('6.0 GB');
-    expect(sys).toContain('16 GB');
   });
 });

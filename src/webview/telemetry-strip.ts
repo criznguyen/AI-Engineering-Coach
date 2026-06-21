@@ -75,7 +75,6 @@ function buildTelemetryStrip(host: HTMLElement): void {
     `<div class="tg-tiles">` +
       `<div class="tg-tile"><span class="tg-tile-label">Process RSS</span><span class="tg-tile-value" id="tg-rss">—</span></div>` +
       `<div class="tg-tile"><span class="tg-tile-label">Session buffers</span><span class="tg-tile-value" id="tg-buf">—</span></div>` +
-      `<div class="tg-tile"><span class="tg-tile-label">System free</span><span class="tg-tile-value" id="tg-sysfree">—</span></div>` +
       `<div class="tg-tile" id="tg-skipped-tile"><span class="tg-tile-label">Skipped</span><span class="tg-tile-value" id="tg-skipped">0</span></div>` +
     `</div>`;
 }
@@ -105,7 +104,6 @@ export function updateTelemetry(t: WorkerTelemetry): void {
   set('tg-cpu-load', t.cpuPct >= 70 ? 'busy' : t.cpuPct >= 25 ? 'active' : 'idle');
   set('tg-rss', fmtMem(t.rssMB));
   set('tg-buf', fmtMem(t.fileBufMB));
-  set('tg-sysfree', `${fmtMem(t.sysFreeMB)} / ${fmtMem(t.sysTotalMB)}`);
 
   // Surface parse warnings: count of files that failed to parse, with skipped malformed lines as
   // secondary detail. The tile is highlighted only when something actually failed; details for
